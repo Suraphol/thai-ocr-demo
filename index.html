@@ -47,20 +47,28 @@
 // ไฟล์ทั้งหมดอยู่ในเครื่อง (ดาวน์โหลดด้วย download_assets.sh)
 const ORT_BASE   = new URL("./lib/ort/", location.href).href;
 const MODEL_BASE = "./models/";
-// ถ้าไฟล์อยู่ใน subfolder อื่น ให้แก้ path 3 บรรทัดนี้
+// ถ้าไฟล์อยู่ใน subfolder อื่น ให้แก้ path 4 บรรทัดนี้
 const DET_URL  = MODEL_BASE + "det.onnx";
 const REC_URL  = MODEL_BASE + "rec.onnx";
 const DICT_URL = MODEL_BASE + "rec_dict.txt";
+const CFG_URL  = MODEL_BASE + "config.json";
 
 const DET_MAX_SIDE = 1280;  // ด้านยาวสุดของภาพที่ส่งเข้า detector
 const DET_THRESH   = 0.2;   // threshold ของ probability map
 const BOX_SCORE    = 0.4;   // คะแนนเฉลี่ยขั้นต่ำของกล่อง
 const UNCLIP       = 1.4;   // ขยายกล่อง
-const REC_HEIGHT   = 48;    // ความสูงภาพบรรทัดที่ส่งเข้า recognizer
-const MIN_CONF     = 0.5;   // ความมั่นใจขั้นต่ำของแต่ละบรรทัด
+
+// ค่าเริ่มต้นของ recognizer และตัวกรองบรรทัด (ตรงกับ DEFAULTS ใน runtime/line_engine.py v2.1.4)
+// ค่าใน models/config.json จะทับค่าเหล่านี้
+const DEFAULT_CFG = {
+  rec:  { height: 48, max_w: 3200, drop_below: 0, min_chars: 1, min_chars_digits: null,
+          min_chars_digits_height: 0, min_chars_latin: false, junk_below: 0, junk_invalid: 1, color: "flatten" },
+  rec2: { file: "", min_mixed: 1 },  // recognizer ตัวที่ 2 สำหรับฟอนต์ไม่มีหัว (2.1.2)
+  join: { decimal_comma: false },
+};
 
 // ====== state ======
-let ort, detSession, recSession, charset;
+let ort, detSession, recSession, rec2Session, charset, cfg;
 let recChannels = 3; // ลอง 3 ช่องก่อน ถ้า error จะลอง 1 ช่อง
 const $ = (id) => document.getElementById(id);
 const status = (t) => ($("status").textContent = t);
@@ -79,10 +87,21 @@ async function loadModels() {
     return new Uint8Array(await r.arrayBuffer());
   };
 
+  cfg = structuredClone(DEFAULT_CFG);
+  const cfgRes = await fetch(CFG_URL);
+  if (cfgRes.ok) { const c = await cfgRes.json(); for (const k in cfg) Object.assign(cfg[k], c[k]); }
+  else console.warn("ไม่พบ " + CFG_URL + " ใช้ค่าเริ่มต้นแทน");
+
+  const opts = { executionProviders: ["wasm"] };
   status("กำลังโหลดโมเดล detector...");
-  detSession = await ort.InferenceSession.create(await getBuf(DET_URL), { executionProviders: ["wasm"] });
+  detSession = await ort.InferenceSession.create(await getBuf(DET_URL), opts);
   status("กำลังโหลดโมเดล recognizer...");
-  recSession = await ort.InferenceSession.create(await getBuf(REC_URL), { executionProviders: ["wasm"] });
+  recSession = await ort.InferenceSession.create(await getBuf(REC_URL), opts);
+  if (cfg.rec2.file) {
+    status("กำลังโหลดโมเดล recognizer ตัวที่ 2 (ฟอนต์ไม่มีหัว)...");
+    try { rec2Session = await ort.InferenceSession.create(await getBuf(MODEL_BASE + cfg.rec2.file), opts); }
+    catch (e) { console.warn("ไม่ใช้ rec2:", e.message); } // ไม่มี rec2 ก็ยังอ่านได้ด้วยตัวแรก
+  }
 
   const dictRes = await fetch(DICT_URL);
   if (!dictRes.ok) throw new Error("โหลดไม่ได้: " + DICT_URL + " (" + dictRes.status + ")");
@@ -159,11 +178,39 @@ function findBoxes(prob, w, h, img) {
 }
 
 // ====== Recognition (CTC greedy) ======
-async function recognize(img, box) {
+const median = (a) => {
+  const s = Float32Array.from(a).sort(), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+
+// ลบพื้นหลังทีละคอลัมน์ (จากขอบบน-ล่างของบรรทัด) ได้ตัวอักษรเข้มบนพื้นขาว
+// ไม่ว่าจะเป็นตัวสีอ่อนบนพื้นเข้มหรือพื้นไล่สี (_flatten ใน line_engine.py)
+function flatten(g, W, H) {
+  const k = Math.max(2, Math.floor(H / 6));
+  const col = new Float32Array(2 * k), bg0 = new Float32Array(W), bg = new Float32Array(W);
+  for (let x = 0; x < W; x++) {
+    for (let y = 0; y < k; y++) { col[y] = g[y * W + x]; col[k + y] = g[(H - 1 - y) * W + x]; }
+    bg0[x] = Math.trunc(median(col));
+  }
+  const r = Math.max(3, Math.min(H | 1, 255)) >> 1, win = new Float32Array(2 * r + 1);
+  for (let x = 0; x < W; x++) {
+    for (let j = -r; j <= r; j++) win[j + r] = bg0[Math.min(W - 1, Math.max(0, x + j))];
+    bg[x] = median(win);
+  }
+  const n = W * H, d = new Float32Array(n), hist = new Uint32Array(256);
+  for (let i = 0; i < n; i++) { d[i] = Math.abs(g[i] - bg[i % W]); hist[Math.min(255, d[i] | 0)]++; }
+  let hi = 0;
+  for (let c = 0; hi < 255; hi++) { c += hist[hi]; if (c >= 0.98 * n) break; }
+  hi = Math.max(hi, 24);
+  for (let i = 0; i < n; i++) g[i] = 255 - Math.min(255, (d[i] * 255) / hi);
+}
+
+// ครอปบรรทัด -> ภาพเทาสูง cfg.rec.height ค่าอยู่ใน [-1, 1] (ใช้ซ้ำได้กับทั้ง rec และ rec2)
+function prepLine(img, box) {
   const bw = box.x1 - box.x0, bh = box.y1 - box.y0;
   if (bw < 4 || bh < 4) return null;
-  const H = REC_HEIGHT;
-  const W = Math.min(2400, Math.max(16, Math.ceil((H * bw) / bh)));
+  const H = cfg.rec.height;
+  const W = Math.min(cfg.rec.max_w, Math.max(16, Math.ceil((H * bw) / bh)));
   const c = document.createElement("canvas");
   c.width = W; c.height = H;
   const ctx = c.getContext("2d", { willReadFrequently: true });
@@ -171,17 +218,19 @@ async function recognize(img, box) {
   ctx.drawImage(img, box.x0, box.y0, bw, bh, 0, 0, W, H);
   const d = ctx.getImageData(0, 0, W, H).data;
 
-  const grey = new Float32Array(W * H);
-  for (let i = 0; i < W * H; i++) {
-    const g = (0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]) / 255;
-    grey[i] = (g - 0.5) / 0.5; // -> [-1, 1]
-  }
+  const g = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) g[i] = Math.round(0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]);
+  if (cfg.rec.color === "flatten") flatten(g, W, H);
+  for (let i = 0; i < W * H; i++) g[i] = (g[i] / 255 - 0.5) / 0.5;
+  return { grey: g, W, H };
+}
 
+async function recognize(session, { grey, W, H }) {
   const feed = async (ch) => {
     let data = grey;
     if (ch === 3) { data = new Float32Array(3 * W * H); for (let k = 0; k < 3; k++) data.set(grey, k * W * H); }
-    const out = await recSession.run({ [recSession.inputNames[0]]: new ort.Tensor("float32", data, [1, ch, H, W]) });
-    return out[recSession.outputNames[0]];
+    const out = await session.run({ [session.inputNames[0]]: new ort.Tensor("float32", data, [1, ch, H, W]) });
+    return out[session.outputNames[0]];
   };
 
   let out;
@@ -197,7 +246,76 @@ async function recognize(img, box) {
     if (best !== 0 && best !== prev) { text += charset[best] ?? ""; confSum += bv; confN++; }
     prev = best;
   }
-  return { text: text.normalize("NFC"), conf: confN ? confSum / confN : 0 };
+  return { text, conf: confN ? confSum / confN : 0 };
+}
+
+// ====== หลังอ่าน: จัดรูปข้อความไทย + กรองบรรทัด (thai_norm.py / line_engine.py v2.1.4) ======
+// glyph ไทยแบบเก่าใน Private Use Area -> อักขระมาตรฐาน
+const PUA = [0x0E10, 0x0E34, 0x0E35, 0x0E36, 0x0E37, 0x0E48, 0x0E49, 0x0E4A, 0x0E4B, 0x0E4C, 0x0E48, 0x0E49,
+  0x0E4A, 0x0E4B, 0x0E4C, 0x0E0D, 0x0E31, 0x0E4D, 0x0E47, 0x0E48, 0x0E49, 0x0E4A, 0x0E4B, 0x0E4C, 0x0E38, 0x0E39, 0x0E3A];
+const VOWEL_MARKS = "ัิีึืฺุู็";
+const TONE_MARKS  = "่้๊๋์๎";
+const MARK_RUN = new RegExp("[" + VOWEL_MARKS + TONE_MARKS + "ํ]{2,}", "g");
+const markRank = (c) => (VOWEL_MARKS.includes(c) ? 0 : TONE_MARKS.includes(c) ? 1 : 2);
+
+// รูปแบบเดียวของข้อความไทยที่พิมพ์ได้หลายแบบแต่แสดงผลเหมือนกัน (canonical ใน thai_norm.py)
+function canonical(text) {
+  text = text.replace(/[-]/g, (c) => String.fromCharCode(PUA[c.charCodeAt(0) - 0xF700]))
+    .replace(/[​‌‍⁠­﻿]/g, "").replace(/ /g, " ").normalize("NFC");
+  text = text.replace(MARK_RUN, (run) => [...run].sort((a, b) => markRank(a) - markRank(b))
+    .filter((c, i, a) => i === 0 || a[i - 1] !== c).join(""));
+  text = text.replace(/([่-๋]?)ํ([่-๋]?)า/g, "$1$2ำ")
+    .replaceAll("เเ", "แ").replaceAll("ำำ", "ำ");
+  return text.replace(/[ \t\f\v]+/g, " ").trim();
+}
+
+// W ที่ควรเป็น พ, 0/O ติดกับเลขไทยที่ควรเป็น ๐
+const fixScripts = (t) => t.replace(/(?<![A-Za-z])[Ww](?=\.?[ก-ฮเ-ไ])/g, "พ")
+  .replace(/(?<=[๐-๙])[Oo0]|[Oo0](?=[๐-๙])/g, "๐");
+// จำนวนเงินที่ใช้ comma แทนจุดทศนิยม: "280,00" -> "280.00"
+const DECIMAL_COMMA = /(?<![0-9๐-๙.,])([0-9๐-๙]{1,3}(?:,[0-9๐-๙]{3})*),([0-9๐-๙]{2})(?![0-9๐-๙.,])/g;
+
+// จำนวนอักษรละตินที่ปนอยู่ในคำไทย: "lละพลNSะทU" -> 4 (สัญญาณว่าเป็นฟอนต์ไม่มีหัว ให้ลอง rec2)
+const mixed = (text) => text.split(/\s+/).filter((tok) => /[ก-๎]/.test(tok))
+  .reduce((n, tok) => n + (tok.match(/[A-Za-z]/g) || []).length, 0);
+
+// สัดส่วนอักขระไทยที่ผิดหลักการสะกด (สระ/วรรณยุกต์ไม่มีพยัญชนะรองรับ ฯลฯ) ใช้กรองตราประทับ/ลายเซ็น
+const MARKS = "ัิีึืฺุู็่้๊๋์ํ๎";
+const isCons = (c) => c >= "ก" && c <= "ฮ";
+function invalidShare(text) {
+  const s = [...text];
+  let thai = 0, bad = 0;
+  s.forEach((ch, i) => {
+    if (ch < "฀" || ch > "๿") return;
+    thai++;
+    const prev = i ? s[i - 1] : " ";
+    if (MARKS.includes(ch) && !(isCons(prev) || (MARKS.includes(prev) && i >= 2 && isCons(s[i - 2])))) bad++;
+    else if ("เแโใไ".includes(ch) && !(i + 1 < s.length && isCons(s[i + 1]))) bad++;
+  });
+  return thai ? bad / thai : 0;
+}
+
+// ความสูงบรรทัดปกติของหน้า: median ของกล่องที่กว้างอย่างน้อย 2 เท่าของความสูง
+function lineHeight(boxes) {
+  const hs = boxes.map((b) => Math.max(b.y1 - b.y0, 1));
+  const lines = hs.filter((h, i) => boxes[i].x1 - boxes[i].x0 >= 2 * h);
+  return hs.length ? median(lines.length >= 3 ? lines : hs) : 1;
+}
+
+// เหตุผลที่ทิ้งบรรทัด หรือ null ถ้าเก็บไว้; hratio = ความสูงกล่อง / ความสูงบรรทัดปกติ
+function dropReason(text, conf, hratio) {
+  const rc = cfg.rec;
+  if (!text) return "empty";
+  if (conf < rc.drop_below) return "low_confidence";
+  const bare = text.replaceAll(" ", "");
+  const cls = rc.min_chars_latin ? /^[0-9๐-๙A-Za-z]+$/ : /^[0-9๐-๙]+$/;
+  let short = rc.min_chars;
+  // ตัวเลข/ตัวอักษรตัวเดียวในช่องตารางไม่ใช่ขยะ ถ้ากล่องสูงพอ
+  if (rc.min_chars_digits != null && cls.test(bare) &&
+      (rc.min_chars_digits_height <= 0 || hratio >= rc.min_chars_digits_height)) short = rc.min_chars_digits;
+  if ([...bare].length < short) return "too_short";
+  if (conf < rc.junk_below && invalidShare(text) > rc.junk_invalid) return "invalid_thai";
+  return null;
 }
 
 // ====== Main ======
@@ -216,19 +334,32 @@ async function processImage(img) {
     const prob = res[detSession.outputNames[0]].data;
     const boxes = findBoxes(prob, w, h, img);
 
-    const lines = [];
+    const lines = [], hmed = lineHeight(boxes);
+    let nRec2 = 0;
     for (let i = 0; i < boxes.length; i++) {
       status(`กำลังอ่านบรรทัด ${i + 1}/${boxes.length}...`);
       const b = boxes[i];
-      const r = await recognize(img, b);
-      vctx.strokeStyle = r && r.conf >= MIN_CONF ? "#16a34a" : "#dc2626";
+      const line = prepLine(img, b);
+      let r = line && await recognize(recSession, line);
+      // มีอักษรละตินปนในคำไทย -> อ่านซ้ำด้วย rec2 แล้วเก็บผลที่ปนน้อยกว่า
+      if (r && rec2Session && mixed(r.text) >= cfg.rec2.min_mixed) {
+        const alt = await recognize(rec2Session, line);
+        if (mixed(alt.text) < mixed(r.text)) { r = alt; nRec2++; }
+      }
+      let text = r ? fixScripts(canonical(r.text)) : "";
+      if (cfg.join.decimal_comma) text = text.replace(DECIMAL_COMMA, "$1.$2");
+      const reason = dropReason(text, r ? r.conf : 0, (b.y1 - b.y0) / hmed);
+      vctx.strokeStyle = reason ? "#dc2626" : "#16a34a";
       vctx.lineWidth = Math.max(2, img.width / 500);
       vctx.strokeRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
-      if (r && r.conf >= MIN_CONF && r.text.trim()) lines.push(r.text.trim());
+      if (reason) console.debug("ทิ้ง:", reason, text, r && r.conf.toFixed(3));
+      else lines.push(text);
       await new Promise((ok) => setTimeout(ok)); // ให้ UI วาดได้
     }
     $("out").value = lines.join("\n");
-    status(`เสร็จแล้ว: พบ ${boxes.length} กล่อง, ใช้ ${lines.length} บรรทัด (กรอบเขียว = ผ่าน, แดง = ความมั่นใจต่ำ)`);
+    status(`เสร็จแล้ว: พบ ${boxes.length} กล่อง, ใช้ ${lines.length} บรรทัด` +
+      (nRec2 ? `, แก้ฟอนต์ไม่มีหัวด้วย rec2 ${nRec2} บรรทัด` : "") +
+      " (กรอบเขียว = ผ่าน, แดง = ถูกกรองทิ้ง)");
   } catch (e) {
     console.error(e);
     status("เกิดข้อผิดพลาด: " + e.message);
