@@ -5,14 +5,23 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Thai OCR Demo (vanilla JS + ONNX Runtime Web)</title>
 <style>
-  body { font-family: system-ui, "Noto Sans Thai", "Thonburi", "Leelawadee UI", sans-serif; max-width: 900px; margin: 1.5rem auto; padding: 0 1rem; }
+  body { font-family: system-ui, "Noto Sans Thai", "Thonburi", "Leelawadee UI", sans-serif; max-width: 1400px; margin: 1.5rem auto; padding: 0 1rem; }
   h1 { font-size: 1.3rem; }
   #drop { border: 2px dashed #999; border-radius: 8px; padding: 1.2rem; text-align: center; color: #555; }
   #drop.over { background: #eef6ff; border-color: #3b82f6; }
   #status { margin: .8rem 0; font-size: .9rem; color: #444; min-height: 1.2em; }
-  canvas { max-width: 100%; border: 1px solid #ddd; margin-top: .5rem; }
-  textarea { width: 100%; height: 12rem; font-size: 1rem; margin-top: .5rem; }
-  button { padding: .5rem 1rem; }
+  /* ซ้าย = ข้อความ, ขวา = รูป (จอแคบจะเรียงบน-ล่าง) */
+  #panes { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; align-items: start; }
+  .pane h3 { margin: 0 0 .5rem; display: flex; justify-content: space-between; align-items: center; }
+  #textPane { position: sticky; top: 1rem; display: flex; flex-direction: column; }
+  canvas { max-width: 100%; border: 1px solid #ddd; display: block; }
+  textarea { width: 100%; box-sizing: border-box; height: calc(100vh - 6rem); min-height: 16rem; font-size: 1rem; line-height: 1.6; resize: vertical; }
+  button { padding: .4rem .9rem; font-size: .9rem; }
+  @media (max-width: 800px) {
+    #panes { grid-template-columns: 1fr; }
+    #textPane { position: static; order: 2; }
+    textarea { height: 14rem; }
+  }
 </style>
 </head>
 <body>
@@ -22,10 +31,16 @@
   <input type="file" id="file" accept="image/*">
 </div>
 <div id="status">พร้อมใช้งาน — ทำงานแบบ offline (โหลดโมเดลจากโฟลเดอร์ models/ ในเครื่อง)</div>
-<canvas id="view"></canvas>
-<h3>ผลลัพธ์</h3>
-<textarea id="out" readonly></textarea>
-<button id="copy">คัดลอกข้อความ</button>
+<div id="panes">
+  <div class="pane" id="textPane">
+    <h3>ผลลัพธ์ <button id="copy">คัดลอกข้อความ</button></h3>
+    <textarea id="out" readonly></textarea>
+  </div>
+  <div class="pane">
+    <h3>รูปต้นฉบับ</h3>
+    <canvas id="view"></canvas>
+  </div>
+</div>
 
 <script type="module">
 // ====== ตั้งค่า (ปรับได้ที่นี่) ======
