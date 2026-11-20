@@ -65,6 +65,8 @@ const DEFAULT_CFG = {
           min_chars_digits_height: 0, min_chars_latin: false, junk_below: 0, junk_invalid: 1, color: "flatten" },
   rec2: { file: "", min_mixed: 1 },  // recognizer ตัวที่ 2 สำหรับฟอนต์ไม่มีหัว (2.1.2)
   join: { decimal_comma: false },
+  det:  { split_gap: 1.2 },          // ตัดกล่องบรรทัดตรงช่องว่างกว้าง >= เท่านี้ของความสูงบรรทัด (0 = ปิด)
+  cols: { list_rep: 0.6, list_facing: 0, list_max_w: 10, list_enum: 0 }, // กันไม่ให้รายการถูกอ่านเป็นคอลัมน์
 };
 
 // ====== state ======
@@ -169,12 +171,7 @@ function findBoxes(prob, w, h, img) {
       y1: Math.min(img.height, Math.ceil((y1 + dist) * sy)),
     });
   }
-  // เรียงตามบรรทัด (บนลงล่าง ซ้ายไปขวา)
-  boxes.sort((a, b) => {
-    const rowTol = Math.min(a.y1 - a.y0, b.y1 - b.y0) * 0.5;
-    return Math.abs(a.y0 - b.y0) < rowTol ? a.x0 - b.x0 : a.y0 - b.y0;
-  });
-  return boxes;
+  return boxes; // ลำดับการอ่านจัดทีหลังใน readingOrder
 }
 
 // ====== Recognition (CTC greedy) ======
@@ -205,21 +202,51 @@ function flatten(g, W, H) {
   for (let i = 0; i < n; i++) g[i] = 255 - Math.min(255, (d[i] * 255) / hi);
 }
 
+// ครอปกล่องจากรูป ย่อ/ขยายเป็น W x H แล้วแปลงเป็นภาพเทา (0-255)
+function cropGrey(img, box, W, H) {
+  const c = document.createElement("canvas");
+  c.width = W; c.height = H;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, H);
+  ctx.drawImage(img, box.x0, box.y0, box.x1 - box.x0, box.y1 - box.y0, 0, 0, W, H);
+  const d = ctx.getImageData(0, 0, W, H).data;
+  const g = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) g[i] = Math.round(0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]);
+  return g;
+}
+
+// ตัดกล่องบรรทัดตรงช่องว่างที่กว้าง >= split_gap เท่าของความสูง และเล็มช่องว่างที่ปลายทิ้ง
+// (detector อาจลากกล่องข้ามช่องว่างระหว่างคอลัมน์ไปถึงตัวแรกของคอลัมน์ถัดไป; split_one ใน line_engine.py)
+function splitLine(img, b) {
+  const ratio = cfg.det.split_gap, w = b.x1 - b.x0, h = b.y1 - b.y0;
+  if (!ratio || w < 4 * h || h < 4) return [b];
+  const g = cropGrey(img, b, w, h);
+  flatten(g, w, h);
+  const ink = new Uint8Array(w);
+  for (let i = 0; i < w * h; i++) if (g[i] < 128) ink[i % w] = 1;
+  const segs = [];
+  let start = null, blank = 0;
+  for (let x = 0; x < w; x++) {
+    if (ink[x]) {
+      if (start === null) start = x;
+      else if (blank >= ratio * h) { segs.push([start, x - blank]); start = x; }
+      blank = 0;
+    } else if (start !== null) blank++;
+  }
+  if (start !== null) segs.push([start, w - blank]);
+  if (!segs.length || (segs.length === 1 && segs[0][0] < ratio * h && w - segs[0][1] < ratio * h)) return [b];
+  const pad = 0.15 * h;
+  return segs.map(([s0, s1]) => ({ x0: b.x0 + Math.max(0, Math.floor(s0 - pad)), x1: b.x0 + Math.min(w, Math.ceil(s1 + pad)),
+                                   y0: b.y0, y1: b.y1 }));
+}
+
 // ครอปบรรทัด -> ภาพเทาสูง cfg.rec.height ค่าอยู่ใน [-1, 1] (ใช้ซ้ำได้กับทั้ง rec และ rec2)
 function prepLine(img, box) {
   const bw = box.x1 - box.x0, bh = box.y1 - box.y0;
   if (bw < 4 || bh < 4) return null;
   const H = cfg.rec.height;
   const W = Math.min(cfg.rec.max_w, Math.max(16, Math.ceil((H * bw) / bh)));
-  const c = document.createElement("canvas");
-  c.width = W; c.height = H;
-  const ctx = c.getContext("2d", { willReadFrequently: true });
-  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, H);
-  ctx.drawImage(img, box.x0, box.y0, bw, bh, 0, 0, W, H);
-  const d = ctx.getImageData(0, 0, W, H).data;
-
-  const g = new Float32Array(W * H);
-  for (let i = 0; i < W * H; i++) g[i] = Math.round(0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]);
+  const g = cropGrey(img, box, W, H);
   if (cfg.rec.color === "flatten") flatten(g, W, H);
   for (let i = 0; i < W * H; i++) g[i] = (g[i] / 255 - 0.5) / 0.5;
   return { grey: g, W, H };
@@ -318,7 +345,199 @@ function dropReason(text, conf, hratio) {
   return null;
 }
 
+// ====== ลำดับการอ่าน: แยกคอลัมน์ด้วย XY-cut (reading_order / _blocks ใน line_engine.py) ======
+// กล่องในที่นี้เป็นสี่เหลี่ยมตั้งตรง จึงไม่มีขั้นแก้ภาพเอียง (deskew) แบบต้นฉบับ
+const mean = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+const isDigit = (c) => /[0-9๐-๙]/.test(c);
+
+// ช่องว่างระหว่างช่วง [lo, hi] ที่กว้างอย่างน้อย minGap
+function gaps(iv, minGap) {
+  iv = [...iv].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const out = [];
+  let reach = iv[0][1];
+  for (const [lo, hi] of iv.slice(1)) {
+    if (lo - reach >= minGap) out.push([reach, lo]);
+    reach = Math.max(reach, hi);
+  }
+  return out;
+}
+
+// คอลัมน์ฝั่งที่ติดกับร่องคอลัมน์ (ฝั่งหนึ่งอาจมีหลายคอลัมน์)
+function nextTo(side, ext, hmed, gutterOnRight) {
+  if (!side.length) return side;
+  const g = gaps(side.map((i) => [ext[i][0], ext[i][1]]), 0.8 * hmed);
+  if (!g.length) return side;
+  return gutterOnRight ? side.filter((i) => ext[i][0] >= g[g.length - 1][1]) : side.filter((i) => ext[i][1] <= g[0][0]);
+}
+
+// คอลัมน์ข้อความเรียงความ: >= 12 บรรทัด, บรรทัดยาว, ครึ่งหนึ่งเต็มความกว้างคอลัมน์, ตัวเลขไม่เกิน 30%, ไม่ซ้ำกัน
+// (ตารางและรายการไม่ผ่าน จึงยังอ่านเป็นแถวตามเดิม)
+function isProse(col, ext, hmed, texts) {
+  if (col.length < 12) return false;
+  const widths = col.map((i) => ext[i][1] - ext[i][0]);
+  const span = Math.max(...col.map((i) => ext[i][1])) - Math.min(...col.map((i) => ext[i][0]));
+  if (median(widths) < 7 * hmed || mean(widths.map((w) => (w >= 0.75 * span ? 1 : 0))) < 0.35) return false;
+  const chars = col.flatMap((i) => [...texts[i]]).filter((c) => !/\s/.test(c));
+  if (chars.length && chars.filter(isDigit).length > 0.3 * chars.length) return false;
+  if (new Set(col.map((i) => texts[i].trim())).size < 0.8 * col.length) return false;
+  return true;
+}
+
+const enumOf = (t) => {
+  const m = /^\s*\(?([0-9๐-๙]{1,4})\s*[.)]/.exec(t);
+  return m ? +m[1].replace(/[๐-๙]/g, (c) => c.charCodeAt(0) - 0x0E50) : null;
+};
+
+// รายการที่เลขเรียงข้ามแถว (ซ้าย n, ขวา n+1) ต้องอ่านข้ามไปทางขวา ไม่ใช่ทีละคอลัมน์
+function numberedAcross(lcol, rcol, ext, hmed, texts) {
+  let pairs = 0;
+  for (const i of lcol) {
+    const a = enumOf(texts[i]);
+    if (a === null) continue;
+    const cy = (ext[i][2] + ext[i][3]) / 2;
+    if (rcol.some((j) => enumOf(texts[j]) === a + 1 && Math.abs((ext[j][2] + ext[j][3]) / 2 - cy) <= 0.5 * hmed)) pairs++;
+  }
+  return pairs >= 0.5 * Math.min(lcol.length, rcol.length);
+}
+
+// สัดส่วนบรรทัดที่ขึ้นต้น 3 ตัวแรกเหมือนกัน (เลขนับเป็นตัวเดียว) เช่น "นาย…", "กรรมการ…"
+function startRep(lines) {
+  const st = lines.map((x) => x.trim()).filter(Boolean).map((x) => [...x.replace(/[0-9๐-๙]+/g, "D")].slice(0, 3).join(""));
+  if (!st.length) return 0;
+  const counts = {};
+  for (const x of st) counts[x] = (counts[x] || 0) + 1;
+  const top = Object.values(counts).sort((a, b) => b - a);
+  return (top[0] + (top[1] || 0)) / st.length;
+}
+
+// สองฝั่งของช่องว่างเป็นคอลัมน์ของรายการ (ชื่อ | ตำแหน่ง) ที่ต้องอ่านทีละแถว
+function listPair(lcol, rcol, ext, hmed, texts) {
+  const r = cfg.cols;
+  if (!(r.list_rep || r.list_facing || r.list_enum) || !lcol.length || !rcol.length) return false;
+  if (r.list_rep && mean([lcol, rcol].map((col) => startRep(col.map((i) => texts[i])))) >= r.list_rep) return true;
+  const [small, other] = lcol.length <= rcol.length ? [lcol, rcol] : [rcol, lcol];
+  const cyO = other.map((j) => (ext[j][2] + ext[j][3]) / 2);
+  const face = mean(small.map((i) => (cyO.some((c) => Math.abs((ext[i][2] + ext[i][3]) / 2 - c) <= 0.5 * hmed) ? 1 : 0)));
+  const wide = Math.max(...[lcol, rcol].map((col) => median(col.map((i) => ext[i][1] - ext[i][0])))) / hmed;
+  if (r.list_facing && face >= r.list_facing && wide < (r.list_max_w ?? 10)) return true;
+  if (r.list_enum && face >= 0.6) return mean(lcol.map((i) => (enumOf(texts[i]) !== null ? 1 : 0))) >= r.list_enum;
+  return false;
+}
+
+const isColumnPair = (lcol, rcol, ext, hmed, texts) =>
+  isProse(lcol, ext, hmed, texts) && isProse(rcol, ext, hmed, texts) &&
+  !numberedAcross(lcol, rcol, ext, hmed, texts) && !listPair(lcol, rcol, ext, hmed, texts);
+
+// XY-cut แบบ recursive: ตัดแนวตั้งก่อน (ร่องที่ไม่มีบรรทัดไหนพาดผ่าน ระหว่างคอลัมน์เรียงความสองฝั่ง)
+// ไม่งั้นตัดแนวนอนที่ช่องว่างกว้างสุด (เช่น หัวเรื่องเต็มความกว้างเหนือคอลัมน์)
+function cutBlocks(idx, ext, hmed, texts, depth) {
+  if (idx.length < 6 || depth > 12) return [idx];
+  const cuts = [];
+  for (const [g0, g1] of gaps(idx.map((i) => [ext[i][0], ext[i][1]]), 0.8 * hmed)) {
+    const left = idx.filter((i) => ext[i][1] <= g0), right = idx.filter((i) => ext[i][0] >= g1);
+    if (isColumnPair(nextTo(left, ext, hmed, true), nextTo(right, ext, hmed, false), ext, hmed, texts))
+      cuts.push([g1 - g0, left, right]);
+  }
+  if (cuts.length) {
+    const [, left, right] = cuts.reduce((a, c) => (c[0] > a[0] ? c : a));
+    return [...cutBlocks(left, ext, hmed, texts, depth + 1), ...cutBlocks(right, ext, hmed, texts, depth + 1)];
+  }
+  const hg = gaps(idx.map((i) => [ext[i][2], ext[i][3]]), 0.8 * hmed);
+  if (!hg.length) return bandedColumns(idx, ext, hmed, texts, depth) || [idx];
+  const [g0, g1] = hg.reduce((a, g) => (g[1] - g[0] > a[1] - a[0] ? g : a));
+  return [...cutBlocks(idx.filter((i) => ext[i][3] <= g0), ext, hmed, texts, depth + 1),
+          ...cutBlocks(idx.filter((i) => ext[i][2] >= g1), ext, hmed, texts, depth + 1)];
+}
+
+// คอลัมน์ที่มีบรรทัดเต็มความกว้างพาดผ่าน (หัวเรื่อง, footer, คำบรรยายภาพ) ซึ่ง cut ปกติหาร่องไม่เจอ:
+// เอาบรรทัดกว้างออกก่อน หาร่องในช่วงกลาง 70% ที่มีบรรทัดพาดไม่เกิน 3% แล้วแบ่งหน้าเป็นแถบ
+// แต่ละแถบอ่านฝั่งซ้ายก่อนแล้วฝั่งขวา ตามด้วยบรรทัดกว้างที่คั่นอยู่
+function bandedColumns(idx, ext, hmed, texts, depth) {
+  const x0 = Math.min(...idx.map((i) => ext[i][0])), x1 = Math.max(...idx.map((i) => ext[i][1]));
+  const wide = idx.filter((i) => ext[i][1] - ext[i][0] >= 0.55 * (x1 - x0));
+  if (wide.length > 0.15 * idx.length) return null;
+  const wideSet = new Set(wide), rest = idx.filter((i) => !wideSet.has(i));
+  if (rest.length < 24) return null;
+  const lo = Math.trunc(x0 + 0.15 * (x1 - x0)), n = Math.trunc(0.7 * (x1 - x0)) + 1;
+  const cover = new Int32Array(n);
+  for (const i of rest) {
+    const a = Math.max(0, Math.trunc(ext[i][0]) - lo), b = Math.min(n, Math.ceil(ext[i][1]) - lo);
+    for (let x = a; x < b; x++) cover[x]++;
+  }
+  const maxCover = Math.max(1, Math.trunc(0.03 * rest.length)), runs = [];
+  for (let x = 0, s = null; x <= n; x++) {
+    const free = x < n && cover[x] <= maxCover;
+    if (free && s === null) s = x;
+    else if (!free && s !== null) { if (x - s >= 0.4 * hmed) runs.push([lo + s, lo + x]); s = null; }
+  }
+  let best = null;
+  runs.forEach(([g0, g1], k) => {
+    const lcol = rest.filter((i) => ext[i][1] <= g0 && (k === 0 || ext[i][0] >= runs[k - 1][1]));
+    const rcol = rest.filter((i) => ext[i][0] >= g1 && (k === runs.length - 1 || ext[i][1] <= runs[k + 1][0]));
+    if (isColumnPair(lcol, rcol, ext, hmed, texts) && (best === null || g1 - g0 > best[0])) best = [g1 - g0, g0, g1];
+  });
+  if (!best) return null;
+  const [, g0, g1] = best, gm = (g0 + g1) / 2;
+  const cy = (i) => (ext[i][2] + ext[i][3]) / 2, cx = (i) => (ext[i][0] + ext[i][1]) / 2;
+  const mid = rest.filter((i) => ext[i][0] < g0 && ext[i][1] > g1), midSet = new Set(mid);
+  const seps = [...wide, ...mid].sort((a, b) => cy(a) - cy(b));
+  const out = [];
+  for (let b = 0; b <= seps.length; b++) {
+    const top = b ? cy(seps[b - 1]) : -Infinity, bot = b < seps.length ? cy(seps[b]) : Infinity;
+    const band = rest.filter((i) => !midSet.has(i) && top < cy(i) && cy(i) <= bot);
+    for (const side of [band.filter((i) => cx(i) < gm), band.filter((i) => cx(i) >= gm)])
+      if (side.length) out.push(...cutBlocks(side, ext, hmed, texts, depth + 1));
+    if (b < seps.length) out.push([seps[b]]);
+  }
+  return out;
+}
+
+// แถวจากบนลงล่าง แต่ละแถวซ้ายไปขวา โดยอ่านทีละบล็อก (คอลัมน์) -> [[index กล่อง, ...], ...]
+function readingOrder(boxes, texts) {
+  if (!boxes.length) return [];
+  const ext = boxes.map((b) => [b.x0, b.x1, b.y0, b.y1]);
+  const hmed = lineHeight(boxes);
+  const blocks = cutBlocks(boxes.map((_, i) => i), ext, hmed, texts, 0);
+  const cy = ext.map((e) => (e[2] + e[3]) / 2), rx = ext.map((e) => (e[0] + e[1]) / 2);
+  const hs = boxes.map((b) => Math.max(b.y1 - b.y0, 1));
+  const tol = 0.5 * hmed, rows = [];
+  for (const blk of blocks) {
+    // จัดแถวจากบรรทัดเต็มความสูงก่อน กล่องเล็ก (สระ/วรรณยุกต์หลุด) ค่อยเข้าแถวที่ใกล้สุดทีหลัง
+    let full = blk.filter((i) => hs[i] >= 0.6 * hmed);
+    if (!full.length) full = [...blk];
+    const fullSet = new Set(full), small = blk.filter((i) => !fullSet.has(i));
+    const brows = [];
+    for (const i of [...full].sort((a, b) => cy[a] - cy[b])) {
+      const last = brows[brows.length - 1];
+      if (last && Math.abs(cy[i] - mean(last.map((j) => cy[j]))) <= tol) last.push(i);
+      else brows.push([i]);
+    }
+    const centre = brows.map((r) => mean(r.map((j) => cy[j])));
+    for (const i of small) {
+      let k = -1, bd = Infinity;
+      centre.forEach((c, n) => { const d = Math.abs(cy[i] - c); if (d < bd) { bd = d; k = n; } });
+      if (k >= 0 && bd <= tol + 0.5 * hs[i]) brows[k].push(i);
+      else { brows.push([i]); centre.push(cy[i]); }
+    }
+    const order = brows.map((_, n) => n).sort((a, b) => centre[a] - centre[b]);
+    for (const n of order) rows.push(brows[n].sort((a, b) => rx[a] - rx[b]));
+  }
+  return rows;
+}
+
 // ====== Main ======
+// อ่านกล่องเดียว; มีอักษรละตินปนในคำไทย -> อ่านซ้ำด้วย rec2 แล้วเก็บผลที่ปนน้อยกว่า
+async function readBox(img, b) {
+  const line = prepLine(img, b);
+  if (!line) return { text: "", conf: 0, rec2: false };
+  const r = await recognize(recSession, line);
+  if (rec2Session && mixed(r.text) >= cfg.rec2.min_mixed) {
+    const alt = await recognize(rec2Session, line);
+    if (mixed(alt.text) < mixed(r.text)) return { ...alt, rec2: true };
+  }
+  return { ...r, rec2: false };
+}
+
 async function processImage(img) {
   const view = $("view");
   view.width = img.width; view.height = img.height;
@@ -334,32 +553,66 @@ async function processImage(img) {
     const prob = res[detSession.outputNames[0]].data;
     const boxes = findBoxes(prob, w, h, img);
 
-    const lines = [], hmed = lineHeight(boxes);
-    let nRec2 = 0;
-    for (let i = 0; i < boxes.length; i++) {
-      status(`กำลังอ่านบรรทัด ${i + 1}/${boxes.length}...`);
-      const b = boxes[i];
-      const line = prepLine(img, b);
-      let r = line && await recognize(recSession, line);
-      // มีอักษรละตินปนในคำไทย -> อ่านซ้ำด้วย rec2 แล้วเก็บผลที่ปนน้อยกว่า
-      if (r && rec2Session && mixed(r.text) >= cfg.rec2.min_mixed) {
-        const alt = await recognize(rec2Session, line);
-        if (mixed(alt.text) < mixed(r.text)) { r = alt; nRec2++; }
-      }
-      let text = r ? fixScripts(canonical(r.text)) : "";
-      if (cfg.join.decimal_comma) text = text.replace(DECIMAL_COMMA, "$1.$2");
-      const reason = dropReason(text, r ? r.conf : 0, (b.y1 - b.y0) / hmed);
-      vctx.strokeStyle = reason ? "#dc2626" : "#16a34a";
-      vctx.lineWidth = Math.max(2, img.width / 500);
-      vctx.strokeRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
-      if (reason) console.debug("ทิ้ง:", reason, text, r && r.conf.toFixed(3));
-      else lines.push(text);
+    // ตัดบรรทัดที่ลากข้ามร่องคอลัมน์ แล้วอ่านทั้งชิ้นที่ตัดและบรรทัดเต็ม (ไว้เทียบกัน)
+    const groups = boxes.map((b) => splitLine(img, b));
+    const changed = groups.map((g, n) => g.length > 1 || g[0] !== boxes[n]);
+    const pieces = groups.flat(), toRead = [...pieces, ...boxes.filter((_, n) => changed[n])];
+    const reads = [];
+    vctx.strokeStyle = "#9ca3af";
+    vctx.lineWidth = Math.max(2, img.width / 500);
+    for (let i = 0; i < toRead.length; i++) {
+      status(`กำลังอ่านบรรทัด ${i + 1}/${toRead.length}...`);
+      if (i < pieces.length) { const b = pieces[i]; vctx.strokeRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0); }
+      reads.push(await readBox(img, toRead[i]));
       await new Promise((ok) => setTimeout(ok)); // ให้ UI วาดได้
     }
-    $("out").value = lines.join("\n");
-    status(`เสร็จแล้ว: พบ ${boxes.length} กล่อง, ใช้ ${lines.length} บรรทัด` +
-      (nRec2 ? `, แก้ฟอนต์ไม่มีหัวด้วย rec2 ${nRec2} บรรทัด` : "") +
-      " (กรอบเขียว = ผ่าน, แดง = ถูกกรองทิ้ง)");
+
+    // ใช้ชิ้นที่ตัดเมื่อทุกชิ้นมั่นใจพอ และได้ตัวอักษรรวม >= 90% ของบรรทัดเต็ม ไม่งั้นใช้บรรทัดเต็ม
+    const final = [], out = [], nChars = (r) => r.text.replaceAll(" ", "").length;
+    let k = 0, e = pieces.length;
+    boxes.forEach((b, n) => {
+      const g = groups[n], r = reads.slice(k, k + g.length);
+      k += g.length;
+      if (changed[n]) {
+        const whole = reads[e++];
+        if (Math.min(...r.map((x) => x.conf)) < cfg.rec.drop_below ||
+            r.reduce((s, x) => s + nChars(x), 0) < 0.9 * nChars(whole)) { final.push(b); out.push(whole); return; }
+      }
+      final.push(...g); out.push(...r);
+    });
+
+    const rows = readingOrder(final, out.map((r) => r.text));
+    const hmed = lineHeight(final), rowTexts = [];
+    vctx.drawImage(img, 0, 0);
+    vctx.font = `bold ${Math.max(12, Math.round(hmed * 0.45))}px system-ui, sans-serif`;
+    vctx.textBaseline = "top";
+    let order = 0, used = 0;
+    for (const row of rows) {
+      const parts = [];
+      for (const i of row) {
+        const b = final[i], r = out[i];
+        let text = fixScripts(canonical(r.text));
+        if (cfg.join.decimal_comma) text = text.replace(DECIMAL_COMMA, "$1.$2");
+        const reason = dropReason(text, r.conf, (b.y1 - b.y0) / hmed);
+        const color = reason ? "#dc2626" : "#16a34a";
+        vctx.strokeStyle = color;
+        vctx.strokeRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+        // ป้ายลำดับการอ่านที่มุมซ้ายบนของกล่อง
+        const label = String(++order), tw = vctx.measureText(label).width + 6;
+        vctx.fillStyle = color;
+        vctx.fillRect(b.x0, b.y0, tw, Math.max(12, Math.round(hmed * 0.45)) + 4);
+        vctx.fillStyle = "#fff";
+        vctx.fillText(label, b.x0 + 3, b.y0 + 2);
+        if (reason) { console.debug("ทิ้ง:", reason, text, r.conf.toFixed(3)); continue; }
+        parts.push(text); used++;
+      }
+      if (parts.length) rowTexts.push(parts.join(" "));
+    }
+    $("out").value = rowTexts.join("\n");
+    const nRec2 = out.filter((r) => r.rec2).length;
+    status(`เสร็จแล้ว: พบ ${final.length} กล่อง, ใช้ ${used} กล่อง (${rowTexts.length} บรรทัด)` +
+      (nRec2 ? `, แก้ฟอนต์ไม่มีหัวด้วย rec2 ${nRec2} กล่อง` : "") +
+      " (กรอบเขียว = ผ่าน, แดง = ถูกกรองทิ้ง, ตัวเลข = ลำดับการอ่าน)");
   } catch (e) {
     console.error(e);
     status("เกิดข้อผิดพลาด: " + e.message);
